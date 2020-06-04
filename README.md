@@ -1,0 +1,2 @@
+# Global-Wheat-Detection
+For the Capstone project, we plan to join an ongoing Kaggle competition: Global Wheat Detection, where we are attempting to predict bounding boxes around each wheat head in images. These images can be used to estimate the density and size of wheat heads in different varieties. Farmers can use the data to assess health and maturity when making management decisions in their fields.
