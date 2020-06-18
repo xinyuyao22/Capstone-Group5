@@ -1,0 +1,115 @@
+SSH Key Setup (Mac)
+-------------------
+Install Xquartz
+Type in Terminal:  ssh-keygen -m PEM -f ~/.ssh/gkey -C Ubuntu
+Create key with your password
+Type in Terminal:  cd ~/.ssh
+				cat gkey.pub
+
+Google Cloud Setup (CPU)
+-------------------
+Go to Compute Engine
+VM Instances -> Create
+CPU Instance Settings:
+	Name:  gw-capstone-cpu-<number>
+	Region:  us-east4 (Northern Virginia)
+	Zone:  us-east4-b
+	Machine Family:  General Purpose
+	Series:  N1
+	Machine Type:  n1-standard-8 (8 vCPU, 32 GB memory) ($220 monthly)
+	Boot Disk: Ubuntu 18.04 LTS, 100 GB
+	Click on Security and paste SSH Key
+	Click Create
+
+Google Cloud Setup (GPU)
+-------------------
+Go to Compute Engine
+VM Instances -> Create
+CPU Instance Settings:
+	Name:  gw-capstone-gpu-<number>
+	Region:  us-east1 (South Carolina)
+	Zone:  us-east1-d
+	Machine Family:  General Purpose
+	Series:  N1
+	Machine Type:  n1-standard-8 (8 vCPU, 32 GB memory) ($220 monthly)
+	GPU Type:  NVIDIA Tesla K80
+	Number of GPUs:  1
+	Boot Disk: Ubuntu 18.04 LTS Minimal, 100 GB
+	Click on Security and paste SSH Key
+	Click Create
+	
+SSH To Instance
+------------------
+CPU:  ssh -X -i ~/.ssh/gkey ubuntu@34.86.132.109
+GPU:  ssh -X -i ~/.ssh/gkey ubuntu@34.75.178.13
+
+
+Install Software on Servers
+---------------------------
+sudo apt-get clean
+sudo apt-get update
+sudo apt-get install git -y
+git clone https://github.com/amir-jafari/Cloud-Computing.git
+cd Cloud-Computing/Deep-Learning-Kit-Installation/Shell-Script-Installation/Ubuntu-18.04/
+mv install-18-04-part1-V3.sh ~
+mv install-18-04-part2-V3.sh ~
+cd ~
+chmod +x install-18-04-part1-V3.sh
+chmod +x install-18-04-part2-V3.sh
+sudo ./install-18-04-part1-V3.sh
+sudo ./install-18-04-part2-V3.sh
+
+Test Software on Servers
+---------------------------
+
+Set Environment. Run the following commands:
+source /etc/environment
+source ~/.bashrc
+
+Tensorflow, Keras, Theano, Pytorch Test:
+Enter the following command on your terminal
+python3
+import tensorflow
+import keras
+import theano
+import torch
+import torchvision
+if you did not get any error then exit out from python by exit()
+
+PyCharm Remote Configuration
+----------------------------
+cd ~
+sudo git clone https://github.com/amir-jafari/Machine-Learning.git
+sudo chmod -R 777 Machine-Learning/
+export DISPLAY=localhost:10.0
+
+PyCharm Local Configuration
+---------------------------
+Open PyCharm -> Create New Project
+Go to Tools -> Deployment -> Configuration..
+Add new 'gcp_gpu'
+Under Connection:
+	Type:  SFTP
+	SFTP host: 34.75.178.13
+	Port: 22
+	Root path: /
+	User name: ubuntu
+	Auth type: Key pair (OpenSSH or Putty)
+	Private key file: ~.ssh/gkey
+	key passphrase: <key password>
+Under Mappings:
+	Deployment path on server 'gcp_gpu': /home/ubuntu/Machine-Learning
+	
+Go to File -> Preferences for New Projects
+Find 'Project Interpreter'
+Add a new Python Interpreter:
+	Click SSH Interpreter
+	Click Existing Environment
+	Select 'gcp_gpu'
+	Click Next
+	Install python2 first (keep default /usr/bin/python)
+	
+Misc. Tips
+----------
+To Auto Upload changes to server:  Tools -> Deployment -> Options
+Select 'Always' for Upload changed files automatically to the default server
