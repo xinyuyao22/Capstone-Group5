@@ -8,6 +8,12 @@ from effdet import get_efficientdet_config, EfficientDet, DetBenchTrain
 from effdet.efficientdet import HeadNet
 
 import pandas as pd
+import gc
+import numba
+import re
+import ast
+from numba import jit
+from typing import List, Union, Tuple
 import numpy as np
 from sklearn.model_selection import StratifiedKFold
 import albumentations as A
@@ -21,8 +27,10 @@ from datetime import datetime
 
 from glob import glob
 from torch.utils.data.sampler import RandomSampler, SequentialSampler
+import matplotlib.pyplot as plt
 
 DIR_INPUT = os.getcwd() + "/"
+DIR_TRAIN = f'{DIR_INPUT}/train'
 
 marking = pd.read_csv('train.csv')
 
@@ -206,183 +214,15 @@ validation_dataset = DatasetRetriever(
     test=True,
 )
 
-class AverageMeter(object):
-    """Computes and stores the average and current value"""
-    def __init__(self):
-        self.reset()
-
-    def reset(self):
-        self.val = 0
-        self.avg = 0
-        self.sum = 0
-        self.count = 0
-
-    def update(self, val, n=1):
-        self.val = val
-        self.sum += val * n
-        self.count += n
-        self.avg = self.sum / self.count
-
-
 import warnings
 
 warnings.filterwarnings("ignore")
 device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
 
-class Fitter:
-
-    def __init__(self, model, device, config):
-        self.config = config
-        self.epoch = 0
-
-        self.base_dir = f'./{config.folder}'
-        if not os.path.exists(self.base_dir):
-            os.makedirs(self.base_dir)
-
-        self.log_path = f'{self.base_dir}/log.txt'
-        self.best_summary_loss = 10 ** 5
-
-        self.model = model
-        self.device = device
-
-        param_optimizer = list(self.model.named_parameters())
-        no_decay = ['bias', 'LayerNorm.bias', 'LayerNorm.weight']
-        optimizer_grouped_parameters = [
-            {'params': [p for n, p in param_optimizer if not any(nd in n for nd in no_decay)], 'weight_decay': 0.001},
-            {'params': [p for n, p in param_optimizer if any(nd in n for nd in no_decay)], 'weight_decay': 0.0}
-        ]
-
-        self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=config.lr)
-        self.scheduler = config.SchedulerClass(self.optimizer, **config.scheduler_params)
-        self.log(f'Fitter prepared. Device is {self.device}')
-
-    def fit(self, train_loader, validation_loader):
-        for e in range(self.config.n_epochs):
-            if self.config.verbose:
-                lr = self.optimizer.param_groups[0]['lr']
-                timestamp = datetime.utcnow().isoformat()
-                self.log(f'\n{timestamp}\nLR: {lr}')
-
-            t = time.time()
-            summary_loss = self.train_one_epoch(train_loader)
-
-            self.log(
-                f'[RESULT]: Train. Epoch: {self.epoch}, summary_loss: {summary_loss.avg:.5f}, time: {(time.time() - t):.5f}')
-            self.save(f'{self.base_dir}/last-checkpoint.bin')
-
-            t = time.time()
-            summary_loss = self.validation(validation_loader)
-
-            self.log(
-                f'[RESULT]: Val. Epoch: {self.epoch}, summary_loss: {summary_loss.avg:.5f}, time: {(time.time() - t):.5f}')
-            if summary_loss.avg < self.best_summary_loss:
-                self.best_summary_loss = summary_loss.avg
-                self.model.eval()
-                self.save(f'{self.base_dir}/best-checkpoint-{str(self.epoch).zfill(3)}epoch.bin')
-                for path in sorted(glob(f'{self.base_dir}/best-checkpoint-*epoch.bin'))[:-3]:
-                    os.remove(path)
-
-            if self.config.validation_scheduler:
-                self.scheduler.step(metrics=summary_loss.avg)
-
-            self.epoch += 1
-
-    def validation(self, val_loader):
-        self.model.eval()
-        summary_loss = AverageMeter()
-        t = time.time()
-        for step, (images, targets, image_ids) in enumerate(val_loader):
-            if self.config.verbose:
-                if step % self.config.verbose_step == 0:
-                    print(f'Val Step {step}/{len(val_loader)}')
-                    print(f'summary_loss: {summary_loss.avg:.5f}')
-                    print(f'time: {(time.time() - t):.5f}')
-
-            with torch.no_grad():
-                images = torch.stack(images)
-                images = images.to(self.device).float()
-                boxes = [target['boxes'].to(self.device).float() for target in targets]
-                labels = [target['labels'].to(self.device).float() for target in targets]
-                ts = {}
-                ts["bbox"] = boxes
-                ts["cls"] = labels
-                ts['img_scale'] = torch.stack(tuple(torch.tensor([1])) * images.shape[0]).float().cuda()
-                ts['img_size'] = torch.stack(tuple(torch.tensor([[512, 512]])) * images.shape[0]).float().cuda()
-
-                batch_size = images.shape[0]
-
-                loss_dict = self.model(images, ts)
-                loss = loss_dict['loss']
-
-            summary_loss.update(loss.detach().item(), batch_size)
-
-            return summary_loss
-
-    def train_one_epoch(self, train_loader):
-        self.model.train()
-        summary_loss = AverageMeter()
-        t = time.time()
-        for step, (images, targets, image_ids) in enumerate(train_loader):
-            if self.config.verbose:
-                if step % self.config.verbose_step == 0:
-                    print(f'Train Step {step}/{len(train_loader)}')
-                    print(f'summary_loss: {summary_loss.avg:.5f}')
-                    print(f'time: {(time.time() - t):.5f}')
-
-            images = torch.stack(images)
-            images = images.to(self.device).float()
-            boxes = [target['boxes'].to(self.device).float() for target in targets]
-            labels = [target['labels'].to(self.device).float() for target in targets]
-            ts = {}
-            ts["bbox"] = boxes
-            ts["cls"] = labels
-
-            batch_size = images.shape[0]
-
-            self.optimizer.zero_grad()
-
-            loss_dict = self.model(images, ts)
-            loss= loss_dict['loss']
-
-            loss.backward()
-
-            summary_loss.update(loss.detach().item(), batch_size)
-
-            self.optimizer.step()
-
-            if self.config.step_scheduler:
-                self.scheduler.step()
-
-        return summary_loss
-
-    def save(self, path):
-        self.model.eval()
-        torch.save({
-            'model_state_dict': self.model.model.state_dict(),
-            'optimizer_state_dict': self.optimizer.state_dict(),
-            'scheduler_state_dict': self.scheduler.state_dict(),
-            'best_summary_loss': self.best_summary_loss,
-            'epoch': self.epoch,
-        }, path)
-
-    def load(self, path):
-        checkpoint = torch.load(path)
-        self.model.model.load_state_dict(checkpoint['model_state_dict'])
-        self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-        self.best_summary_loss = checkpoint['best_summary_loss']
-        self.epoch = checkpoint['epoch'] + 1
-
-    def log(self, message):
-        if self.config.verbose:
-            print(message)
-            with open(self.log_path, 'a+') as logger:
-                logger.write(f'{message}\n')
-
 class TrainGlobalConfig:
-    num_workers = 4
-    batch_size = 4
-    n_epochs = 40 # n_epochs = 40
+    num_workers = 1
+    batch_size = 1
+    n_epochs = 3 # n_epochs = 40
     lr = 0.0002
 
     folder = 'effdet5-cutmix-augmix'
@@ -422,20 +262,180 @@ class TrainGlobalConfig:
 def collate_fn(batch):
     return tuple(zip(*batch))
 
-def run_training():
+class AverageMeter(object):
+    """Computes and stores the average and current value"""
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        self.val = 0
+        self.avg = 0
+        self.sum = 0
+        self.count = 0
+
+    def update(self, val, n=1):
+        self.val = val
+        self.sum += val * n
+        self.count += n
+        self.avg = self.sum / self.count
+
+def calculate_iou(gt, pr, form='pascal_voc'):
+    """Calculates the Intersection over Union.
+
+    Args:
+        gt: (np.ndarray[Union[int, float]]) coordinates of the ground-truth box
+        pr: (np.ndarray[Union[int, float]]) coordinates of the prdected box
+        form: (str) gt/pred coordinates format
+            - pascal_voc: [xmin, ymin, xmax, ymax]
+            - coco: [xmin, ymin, w, h]
+    Returns:
+        (float) Intersection over union (0.0 <= iou <= 1.0)
+    """
+    if form == 'coco':
+        gt = gt.copy()
+        pr = pr.detach().cpu().numpy()
+
+        gt[2] = gt[0] + gt[2]
+        gt[3] = gt[1] + gt[3]
+        pr[2] = pr[0] + pr[2]
+        pr[3] = pr[1] + pr[3]
+
+        # Calculate overlap area
+    dx = min(gt[2], pr[2]) - max(gt[0], pr[0])
+
+    if dx < 0:
+        return 0.0
+
+    dy = min(gt[3], pr[3]) - max(gt[1], pr[1])
+
+    if dy < 0:
+        return 0.0
+
+    overlap_area = dx * dy
+
+    # Calculate union area
+    union_area = (
+            (gt[2] - gt[0]) * (gt[3] - gt[1]) +
+            (pr[2] - pr[0]) * (pr[3] - pr[1]) -overlap_area
+    )
+
+    return overlap_area / union_area
+
+def find_best_match(gts, pred, pred_idx, threshold = 0.5, form = 'pascal_voc', ious=None):
+    """Returns the index of the 'best match' between the
+    ground-truth boxes and the prediction. The 'best match'
+    is the highest IoU. (0.0 IoUs are ignored).
+
+    Args:
+        gts: (List[List[Union[int, float]]]) Coordinates of the available ground-truth boxes
+        pred: (List[Union[int, float]]) Coordinates of the predicted box
+        pred_idx: (int) Index of the current predicted box
+        threshold: (float) Threshold
+        form: (str) Format of the coordinates
+        ious: (np.ndarray) len(gts) x len(preds) matrix for storing calculated ious.
+
+    Return:
+        (int) Index of the best match GT box (-1 if no match above threshold)
+    """
+    best_match_iou = -np.inf
+    best_match_idx = -1
+
+    for gt_idx in range(len(gts)):
+
+        if gts[gt_idx][0] < 0:
+            # Already matched GT-box
+            continue
+
+        iou = -1 if ious is None else ious[gt_idx][pred_idx]
+
+        if iou < 0:
+            iou = calculate_iou(gts[gt_idx], pred, form=form)
+
+            if ious is not None:
+                ious[gt_idx][pred_idx] = iou
+
+        if iou < threshold:
+            continue
+
+        if iou > best_match_iou:
+            best_match_iou = iou
+            best_match_idx = gt_idx
+
+        return best_match_idx
+
+
+def calculate_precision(gts, preds, threshold = 0.5, form = 'coco', ious=None):
+    """Calculates precision for GT - prediction pairs at one threshold.
+
+    Args:
+        gts: (List[List[Union[int, float]]]) Coordinates of the available ground-truth boxes
+        preds: (List[List[Union[int, float]]]) Coordinates of the predicted boxes,
+               sorted by confidence value (descending)
+        threshold: (float) Threshold
+        form: (str) Format of the coordinates
+        ious: (np.ndarray) len(gts) x len(preds) matrix for storing calculated ious.
+
+    Return:
+        (float) Precision
+    """
+    n = len(preds)
+    tp = 0
+    fp = 0
+
+    # for pred_idx, pred in enumerate(preds_sorted):
+    for pred_idx in range(n):
+
+        best_match_gt_idx = find_best_match(gts, preds[pred_idx], pred_idx,
+                                            threshold=threshold, form=form, ious=ious)
+        best_match_gt_idx = int(-1 if best_match_gt_idx is None else best_match_gt_idx)
+
+        if best_match_gt_idx >= 0:
+            # True positive: The predicted box matches a gt box with an IoU above the threshold.
+            tp += 1
+            # Remove the matched GT box
+            gts[best_match_gt_idx] = -1
+
+        else:
+            # No match
+            # False positive: indicates a predicted box had no associated gt box.
+            fp += 1
+
+            # False negative: indicates a gt box had no associated predicted box.
+        fn = (gts.sum(axis=1) > 0).sum()
+
+        return tp / (tp + fp + fn)
+
+
+def calculate_image_precision(gts, preds, thresholds = (0.5, ), form = 'coco'):
+    """Calculates image precision.
+
+    Args:
+        gts: (List[List[Union[int, float]]]) Coordinates of the available ground-truth boxes
+        preds: (List[List[Union[int, float]]]) Coordinates of the predicted boxes,
+               sorted by confidence value (descending)
+        thresholds: (float) Different thresholds
+        form: (str) Format of the coordinates
+
+    Return:
+        (float) Precision
+    """
+    n_threshold = len(thresholds)
+    image_precision = 0.0
+    ious = np.ones((len(gts), len(preds))) * -1
+    # ious = None
+
+    for threshold in thresholds:
+        precision_at_threshold = calculate_precision(gts.copy(), preds, threshold=threshold,
+                                                     form=form, ious=ious)
+        image_precision += precision_at_threshold / n_threshold
+
+    return image_precision
+
+def detecting():
     device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
     net.to(device)
 
-    train_loader = torch.utils.data.DataLoader(
-        train_dataset,
-        batch_size=TrainGlobalConfig.batch_size,
-        sampler=RandomSampler(train_dataset),
-        pin_memory=False,
-        drop_last=True,
-        num_workers=TrainGlobalConfig.num_workers,
-        collate_fn=collate_fn,
-    )
-    val_loader = torch.utils.data.DataLoader(
+    data_loader = torch.utils.data.DataLoader(
         validation_dataset,
         batch_size=TrainGlobalConfig.batch_size,
         num_workers=TrainGlobalConfig.num_workers,
@@ -445,25 +445,84 @@ def run_training():
         collate_fn=collate_fn,
     )
 
-    fitter = Fitter(model=net, device=device, config=TrainGlobalConfig)
-    fitter.fit(train_loader, val_loader)
+    net.eval()
 
-def get_net():
+    iou_thresholds = [x for x in np.arange(0.5, 0.751, 0.05)]
+    image_precision = 0
+
+    for step, (images, targets, image_ids) in enumerate(data_loader):
+        with torch.no_grad():
+            images = torch.stack(images)
+            images = images.to(device).float()
+            gt = [target['boxes'].to(device).float() for target in targets]
+            labels = [target['labels'].to(device).float() for target in targets]
+            ts = {}
+            ts["bbox"] = gt
+            ts["cls"] = labels
+            ts['img_scale'] = torch.stack(tuple(torch.tensor([1])) * images.shape[0]).float().cuda()
+            ts['img_size'] = torch.stack(tuple(torch.tensor([[512, 512]])) * images.shape[0]).float().cuda()
+
+            out = net(images, ts)
+            det = out['detections']
+            boxes = det[0].detach().cpu().numpy()[:, :4]
+            scores = det[0].detach().cpu().numpy()[:, 4]
+
+            preds_sorted_idx = np.argsort(scores)[::-1]
+            preds_sorted = boxes[preds_sorted_idx]
+
+            image_precision = calculate_image_precision(preds_sorted,
+                                                        gt[0],
+                                                        thresholds=iou_thresholds,
+                                                        form='coco')
+            indexes = np.where(scores > 0.5)[0]
+            boxes = boxes[indexes]
+
+            show_result(image_ids, boxes, gt[0])
+
+        break
+    print("IOU: {0:.4f}".format(image_precision))
+
+
+def load_net(checkpoint_path):
     config = get_efficientdet_config('tf_efficientdet_d5')
     net = EfficientDet(config, pretrained_backbone=False)
-    # checkpoint = torch.load(f'{DIR_INPUT}/input/efficientdet/efficientdet_d4-5b370b7a.pth')
-    checkpoint = torch.load(f'{DIR_INPUT}/input/efficientdet/efficientdet_d5-ef44aea8.pth')
-    net.load_state_dict(checkpoint)
-    # checkpoint = torch.load(f'{DIR_INPUT}/input/efficientdet/fold0-best-all-states.bin')
-    # net.load_state_dict(checkpoint['model_state_dict'])
-
-    # del checkpoint
 
     config.num_classes = 1
-    config.image_size = 512
+    config.image_size=512
     net.class_net = HeadNet(config, num_outputs=config.num_classes, norm_kwargs=dict(eps=.001, momentum=.01))
+
+    checkpoint = torch.load(checkpoint_path)
+    net.load_state_dict(checkpoint['model_state_dict'])
+
+    del checkpoint
+    gc.collect()
+
+    net.eval()
     return DetBenchTrain(net, config)
 
-net = get_net()
+net = load_net(f'{DIR_INPUT}/effdet5-cutmix-augmix/best-checkpoint-005epoch.bin')
 
-run_training()
+def show_result(sample_id, preds, gt_boxes):
+    sample = cv2.imread(f'{DIR_TRAIN}/{sample_id}.jpg', cv2.IMREAD_COLOR)
+    sample = cv2.cvtColor(sample, cv2.COLOR_BGR2RGB)
+
+    fig, ax = plt.subplots(1, 1, figsize=(16, 8))
+
+    for pred_box in preds:
+        cv2.rectangle(
+            sample,
+            (pred_box[0], pred_box[1]),
+            (pred_box[0] + pred_box[2], pred_box[1] + pred_box[3]),
+            (220, 0, 0), 2
+        )
+
+    for gt_box in gt_boxes:
+        cv2.rectangle(
+            sample,
+            (gt_box[0], gt_box[1]),
+            (gt_box[2], gt_box[3]),
+            (0, 0, 220), 2
+        )
+    cv2.imwrite('sample_pred.jpg', sample)
+
+detecting()
