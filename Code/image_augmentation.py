@@ -29,7 +29,7 @@ if 'augmented_train.csv' not in os.listdir():
     bboxs = np.stack(marking['bbox'].apply(lambda x: np.fromstring(x[1:-1], sep=',')))
     for i, column in enumerate(['x', 'y', 'w', 'h']):
         marking[column] = bboxs[:, i]
-    marking.drop(columns=['bbox'], inplace=True)
+    marking.drop(columns=['bbox', 'area'], inplace=True)
 
     # duplicate images from inrae_1 and ethz_1
     inrae_ethz = marking[marking['source'].isin(['inrae_1', 'ethz_1'])]
@@ -77,7 +77,7 @@ def get_train_transforms():
             A.OneOf([
                 A.RandomGamma(p=0.3),
                 A.RGBShift(p=0.4),
-                A.RandomBrightnessContrast(p=0.3)
+                A.RandomBrightnessContrast(brightness_limit = 0.4, contrast_limit=0.8, p=0.3)
             ],p=0.5),
             A.Blur(p=0.5),
             A.RandomRotate90(p=0.5),
