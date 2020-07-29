@@ -75,10 +75,10 @@ def get_train_transforms():
         [
             A.RandomSizedBBoxSafeCrop(1024, 1024, erosion_rate=0.0, interpolation=1, p=1.0),
             A.OneOf([
-                A.RandomGamma(p=0.3),
-                A.RGBShift(p=0.4),
-                A.RandomBrightnessContrast(brightness_limit = 0.4, contrast_limit=0.8, p=0.3)
+                A.RandomGamma(p=0.5),
+                A.RandomBrightnessContrast(brightness_limit = 0.4, contrast_limit=0.8, p=0.5)
             ],p=0.5),
+            A.HueSaturationValue(hue_shift_limit=0.4, sat_shift_limit=0.4, val_shift_limit=0.4, p=0.4),
             A.Blur(p=0.5),
             A.RandomRotate90(p=0.5),
             A.CoarseDropout(p=0.5),
