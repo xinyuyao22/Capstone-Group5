@@ -1,13 +1,18 @@
 import os
-# os.system("sudo pip install timm")
-# os.system("sudo pip install effdet")
-# os.system("sudo pip install omegaconf")
-# os.system("sudo pip install pycocotools")
+#os.system("sudo pip install timm")
+#os.system("sudo pip install effdet")
+#os.system("sudo pip install omegaconf")
+#os.system("sudo pip install pycocotools")
+#os.system("sudo pip install albumentations")
+#os.system("sudo apt remove timm")
+#os.system("sudo pip3 uninstall apex && git clone https://www.github.com/nvidia/apex && cd apex && python3 setup.py install && rm -rf ../apex")
 
-from effdet import get_efficientdet_config, EfficientDet, DetBenchTrain
+from effdet import get_efficientdet_config, EfficientDet, DetBenchTrain, DetBenchPredict
 from effdet.efficientdet import HeadNet
 
 import pandas as pd
+import re
+import ast
 import numpy as np
 from sklearn.model_selection import StratifiedKFold
 import albumentations as A
@@ -18,18 +23,14 @@ import cv2
 from torch.utils.data import DataLoader, Dataset
 import time
 from datetime import datetime
+import gc
 
 from glob import glob
 from torch.utils.data.sampler import RandomSampler, SequentialSampler
 
 DIR_INPUT = os.getcwd() + "/"
 
-marking = pd.read_csv('train.csv')
-
-bboxs = np.stack(marking['bbox'].apply(lambda x: np.fromstring(x[1:-1], sep=',')))
-for i, column in enumerate(['x', 'y', 'w', 'h']):
-    marking[column] = bboxs[:,i]
-marking.drop(columns=['bbox'], inplace=True)
+marking=pd.read_csv('augmented_train_2.csv')
 
 skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
 
@@ -49,15 +50,16 @@ for fold_number, (train_index, val_index) in enumerate(skf.split(X=df_folds.inde
 def get_train_transforms():
     return A.Compose(
         [
-            A.RandomSizedCrop(min_max_height=(600, 1000), height=1024, width=1024, w2h_ratio=1, p=0.5),
+            A.HueSaturationValue(hue_shift_limit=0.4, sat_shift_limit=0.4, val_shift_limit=0.4, p=0.5),
             A.OneOf([
-                A.RandomGamma(p=0.4),
-                A.RGBShift(p=0.3),
-                A.RandomBrightnessContrast(p=0.3)
-            ],p=0.9),
-            A.HorizontalFlip(p=0.5),
-            A.VerticalFlip(p=0.5),
-            A.Resize(height=512, width=512, p=1.0),
+                A.RandomGamma(p=0.5),
+                A.RandomBrightnessContrast(brightness_limit=0.4, contrast_limit=0.85, p=0.5)
+            ], p=0.5),
+            A.Blur(p=0.5),
+            A.ToGray(p=0.1),
+            A.RandomRotate90(p=0.5),
+            A.Resize(height=1024, width=1024, p=1),
+            A.Cutout(num_holes=10, max_h_size=64, max_w_size=64, fill_value=0, p=0.5),
             ToTensorV2(p=1.0),
         ],
         p=1.0,
@@ -65,14 +67,12 @@ def get_train_transforms():
             format='pascal_voc',
             min_area=0,
             min_visibility=0,
-            label_fields=['labels']
-        )
-    )
+            label_fields=['labels']))
 
 def get_valid_transforms():
     return A.Compose(
         [
-            A.Resize(height=512, width=512, p=1.0),
+            A.Resize(height=1024, width=1024, p=1.0),
             ToTensorV2(p=1.0),
         ],
         p=1.0,
@@ -103,7 +103,7 @@ class DatasetRetriever(Dataset):
         if self.test or random.random() > 0.5:
             image, boxes = self.load_image_and_boxes(index)
         else:
-            image, boxes = self.load_cutmix_image_and_boxes(index)
+            image, boxes = self.load_mixup_image_and_boxes(index)
 
         # there is only one class
         labels = torch.ones((boxes.shape[0],), dtype=torch.int64)
@@ -144,56 +144,15 @@ class DatasetRetriever(Dataset):
         boxes[:, 3] = boxes[:, 1] + boxes[:, 3]
         return image, boxes
 
-    def load_cutmix_image_and_boxes(self, index, imsize=1024):
-        """
-        This implementation of cutmix author:  https://www.kaggle.com/nvnnghia
-        Refactoring and adaptation: https://www.kaggle.com/shonenkov
-        """
-        w, h = imsize, imsize
-        s = imsize // 2
+    def load_mixup_image_and_boxes(self, index):
+        image, boxes = self.load_image_and_boxes(index)
+        r_image, r_boxes = self.load_image_and_boxes(random.randint(0, self.image_ids.shape[0] - 1))
+        return (image + r_image) / 2, np.vstack((boxes, r_boxes)).astype(np.int32)
 
-        xc, yc = [int(random.uniform(imsize * 0.25, imsize * 0.75)) for _ in range(2)]  # center x, y
-        indexes = [index] + [random.randint(0, self.image_ids.shape[0] - 1) for _ in range(3)]
-
-        result_image = np.full((imsize, imsize, 3), 1, dtype=np.float32)
-        result_boxes = []
-
-        for i, index in enumerate(indexes):
-            image, boxes = self.load_image_and_boxes(index)
-            if i == 0:
-                x1a, y1a, x2a, y2a = max(xc - w, 0), max(yc - h, 0), xc, yc  # xmin, ymin, xmax, ymax (large image)
-                x1b, y1b, x2b, y2b = w - (x2a - x1a), h - (y2a - y1a), w, h  # xmin, ymin, xmax, ymax (small image)
-            elif i == 1:  # top right
-                x1a, y1a, x2a, y2a = xc, max(yc - h, 0), min(xc + w, s * 2), yc
-                x1b, y1b, x2b, y2b = 0, h - (y2a - y1a), min(w, x2a - x1a), h
-            elif i == 2:  # bottom left
-                x1a, y1a, x2a, y2a = max(xc - w, 0), yc, xc, min(s * 2, yc + h)
-                x1b, y1b, x2b, y2b = w - (x2a - x1a), 0, max(xc, w), min(y2a - y1a, h)
-            elif i == 3:  # bottom right
-                x1a, y1a, x2a, y2a = xc, yc, min(xc + w, s * 2), min(s * 2, yc + h)
-                x1b, y1b, x2b, y2b = 0, 0, min(w, x2a - x1a), min(y2a - y1a, h)
-            result_image[y1a:y2a, x1a:x2a] = image[y1b:y2b, x1b:x2b]
-            padw = x1a - x1b
-            padh = y1a - y1b
-
-            boxes[:, 0] += padw
-            boxes[:, 1] += padh
-            boxes[:, 2] += padw
-            boxes[:, 3] += padh
-
-            result_boxes.append(boxes)
-
-        result_boxes = np.concatenate(result_boxes, 0)
-        np.clip(result_boxes[:, 0:], 0, 2 * s, out=result_boxes[:, 0:])
-        result_boxes = result_boxes.astype(np.int32)
-        result_boxes = result_boxes[
-            np.where((result_boxes[:, 2] - result_boxes[:, 0]) * (result_boxes[:, 3] - result_boxes[:, 1]) > 0)]
-        return result_image, result_boxes
-
-fold_number = 0
+fold_number = 1
 
 train_dataset = DatasetRetriever(
-    image_ids=df_folds[df_folds['fold'] != fold_number].index.values,
+    image_ids=df_folds.index.values,
     marking=marking,
     transforms=get_train_transforms(),
     test=False,
@@ -224,6 +183,158 @@ class AverageMeter(object):
         self.avg = self.sum / self.count
 
 
+def calculate_iou(gt, pr, form='pascal_voc'):
+    """Calculates the Intersection over Union.
+
+    Args:
+        gt: (np.ndarray[Union[int, float]]) coordinates of the ground-truth box
+        pr: (np.ndarray[Union[int, float]]) coordinates of the prdected box
+        form: (str) gt/pred coordinates format
+            - pascal_voc: [xmin, ymin, xmax, ymax]
+            - coco: [xmin, ymin, w, h]
+    Returns:
+        (float) Intersection over union (0.0 <= iou <= 1.0)
+    """
+    if form == 'coco':
+        gt = gt.copy()
+        pr = pr.detach().cpu().numpy()
+
+        gt[2] = gt[0] + gt[2]
+        gt[3] = gt[1] + gt[3]
+        pr[2] = pr[0] + pr[2]
+        pr[3] = pr[1] + pr[3]
+
+        # Calculate overlap area
+    dx = min(gt[2], pr[2]) - max(gt[0], pr[0])
+
+    if dx < 0:
+        return 0.0
+
+    dy = min(gt[3], pr[3]) - max(gt[1], pr[1])
+
+    if dy < 0:
+        return 0.0
+
+    overlap_area = dx * dy
+
+    # Calculate union area
+    union_area = (
+            (gt[2] - gt[0]) * (gt[3] - gt[1]) +
+            (pr[2] - pr[0]) * (pr[3] - pr[1]) -overlap_area
+    )
+
+    return overlap_area / union_area
+
+def find_best_match(gts, pred, pred_idx, threshold = 0.5, form = 'pascal_voc', ious=None):
+    """Returns the index of the 'best match' between the
+    ground-truth boxes and the prediction. The 'best match'
+    is the highest IoU. (0.0 IoUs are ignored).
+
+    Args:
+        gts: (List[List[Union[int, float]]]) Coordinates of the available ground-truth boxes
+        pred: (List[Union[int, float]]) Coordinates of the predicted box
+        pred_idx: (int) Index of the current predicted box
+        threshold: (float) Threshold
+        form: (str) Format of the coordinates
+        ious: (np.ndarray) len(gts) x len(preds) matrix for storing calculated ious.
+
+    Return:
+        (int) Index of the best match GT box (-1 if no match above threshold)
+    """
+    best_match_iou = -np.inf
+    best_match_idx = -1
+
+    for gt_idx in range(len(gts)):
+
+        if gts[gt_idx][0] < 0:
+            # Already matched GT-box
+            continue
+
+        iou = -1 if ious is None else ious[gt_idx][pred_idx]
+
+        if iou < 0:
+            iou = calculate_iou(gts[gt_idx], pred, form=form)
+
+            if ious is not None:
+                ious[gt_idx][pred_idx] = iou
+
+        if iou < threshold:
+            continue
+
+        if iou > best_match_iou:
+            best_match_iou = iou
+            best_match_idx = gt_idx
+
+        return best_match_idx
+
+
+def calculate_precision(gts, preds, threshold = 0.5, form = 'coco', ious=None):
+    """Calculates precision for GT - prediction pairs at one threshold.
+
+    Args:
+        gts: (List[List[Union[int, float]]]) Coordinates of the available ground-truth boxes
+        preds: (List[List[Union[int, float]]]) Coordinates of the predicted boxes,
+               sorted by confidence value (descending)
+        threshold: (float) Threshold
+        form: (str) Format of the coordinates
+        ious: (np.ndarray) len(gts) x len(preds) matrix for storing calculated ious.
+
+    Return:
+        (float) Precision
+    """
+    n = len(preds)
+    tp = 0
+    fp = 0
+
+    # for pred_idx, pred in enumerate(preds_sorted):
+    for pred_idx in range(n):
+
+        best_match_gt_idx = find_best_match(gts, preds[pred_idx], pred_idx,
+                                            threshold=threshold, form=form, ious=ious)
+        best_match_gt_idx = int(-1 if best_match_gt_idx is None else best_match_gt_idx)
+
+        if best_match_gt_idx >= 0:
+            # True positive: The predicted box matches a gt box with an IoU above the threshold.
+            tp += 1
+            # Remove the matched GT box
+            gts[best_match_gt_idx] = -1
+
+        else:
+            # No match
+            # False positive: indicates a predicted box had no associated gt box.
+            fp += 1
+
+            # False negative: indicates a gt box had no associated predicted box.
+        fn = (gts.sum(axis=1) > 0).sum()
+
+        return tp / (tp + fp + fn)
+
+
+def calculate_image_precision(gts, preds, thresholds = (0.5, ), form = 'coco'):
+    """Calculates image precision.
+
+    Args:
+        gts: (List[List[Union[int, float]]]) Coordinates of the available ground-truth boxes
+        preds: (List[List[Union[int, float]]]) Coordinates of the predicted boxes,
+               sorted by confidence value (descending)
+        thresholds: (float) Different thresholds
+        form: (str) Format of the coordinates
+
+    Return:
+        (float) Precision
+    """
+    n_threshold = len(thresholds)
+    image_precision = 0.0
+    ious = np.ones((len(gts), len(preds))) * -1
+    # ious = None
+
+    for threshold in thresholds:
+        precision_at_threshold = calculate_precision(gts.copy(), preds, threshold=threshold,
+                                                     form=form, ious=ious)
+        image_precision += precision_at_threshold / n_threshold
+
+    return image_precision
+
 import warnings
 
 warnings.filterwarnings("ignore")
@@ -240,7 +351,7 @@ class Fitter:
             os.makedirs(self.base_dir)
 
         self.log_path = f'{self.base_dir}/log.txt'
-        self.best_summary_loss = 10 ** 5
+        self.best_summary_prec = 0.0
 
         self.model = model
         self.device = device
@@ -258,6 +369,9 @@ class Fitter:
 
     def fit(self, train_loader, validation_loader):
         for e in range(self.config.n_epochs):
+            if e != 0:
+                self.model = load_train_net(f'{self.base_dir}/last-checkpoint.bin')
+                self.model = self.model.to(self.device)
             if self.config.verbose:
                 lr = self.optimizer.param_groups[0]['lr']
                 timestamp = datetime.utcnow().isoformat()
@@ -270,27 +384,22 @@ class Fitter:
                 f'[RESULT]: Train. Epoch: {self.epoch}, summary_loss: {summary_loss.avg:.5f}, time: {(time.time() - t):.5f}')
             self.save(f'{self.base_dir}/last-checkpoint.bin')
 
-            t = time.time()
-            summary_loss = self.validation(validation_loader)
-
-            self.log(
-                f'[RESULT]: Val. Epoch: {self.epoch}, summary_loss: {summary_loss.avg:.5f}, time: {(time.time() - t):.5f}')
-            if summary_loss.avg < self.best_summary_loss:
-                self.best_summary_loss = summary_loss.avg
-                self.model.eval()
-                self.save(f'{self.base_dir}/best-checkpoint-{str(self.epoch).zfill(3)}epoch.bin')
-                for path in sorted(glob(f'{self.base_dir}/best-checkpoint-*epoch.bin'))[:-3]:
-                    os.remove(path)
+            self.model.eval()
+            self.save(f'{self.base_dir}/best-checkpoint_1-{str(self.epoch).zfill(3)}epoch.bin')
 
             if self.config.validation_scheduler:
                 self.scheduler.step(metrics=summary_loss.avg)
 
             self.epoch += 1
 
+
     def validation(self, val_loader):
         self.model.eval()
         summary_loss = AverageMeter()
+        summary_prec = AverageMeter()
         t = time.time()
+        validation_image_precisions = []
+        iou_thresholds = [x for x in np.arange(0.5, 0.751, 0.05)]
         for step, (images, targets, image_ids) in enumerate(val_loader):
             if self.config.verbose:
                 if step % self.config.verbose_step == 0:
@@ -301,22 +410,47 @@ class Fitter:
             with torch.no_grad():
                 images = torch.stack(images)
                 images = images.to(self.device).float()
-                boxes = [target['boxes'].to(self.device).float() for target in targets]
-                labels = [target['labels'].to(self.device).float() for target in targets]
+                batch_size = images.shape[0]
+                gt = [target['boxes'].to(device).float() for target in targets]
+                labels = [target['labels'].to(device).float() for target in targets]
                 ts = {}
-                ts["bbox"] = boxes
+                ts["bbox"] = gt
                 ts["cls"] = labels
                 ts['img_scale'] = torch.stack(tuple(torch.tensor([1])) * images.shape[0]).float().cuda()
-                ts['img_size'] = torch.stack(tuple(torch.tensor([[512, 512]])) * images.shape[0]).float().cuda()
+                ts['img_size'] = torch.stack(tuple(torch.tensor([[1024, 1024]])) * images.shape[0]).float().cuda()
 
-                batch_size = images.shape[0]
+                predictions = []
 
-                loss_dict = self.model(images, ts)
-                loss = loss_dict['loss']
+                out = self.model(images, ts['img_scale'], ts['img_size'])
+                det = out['detections']
+                loss = out['loss']
+                summary_loss.update(loss.detach().item(), batch_size)
 
-            summary_loss.update(loss.detach().item(), batch_size)
+                for i in range(images.shape[0]):
+                    boxes = det[i].detach().cpu().numpy()[:, :4]
+                    scores = det[i].detach().cpu().numpy()[:, 4]
+                    predictions.append({
+                        'boxes': boxes,
+                        'scores': scores,
+                    })
 
-            return summary_loss
+            for idx, prediction in enumerate(predictions):
+                scores = prediction['scores']
+                preds = prediction['boxes']
+
+                preds_sorted_idx = np.argsort(scores)[::-1]
+                preds_sorted = preds[preds_sorted_idx]
+
+                image_precision = calculate_image_precision(preds_sorted,
+                                                            gt[idx],
+                                                            thresholds=iou_thresholds,
+                                                            form='coco')
+
+                validation_image_precisions.append(image_precision)
+
+            summary_prec.update(np.mean(validation_image_precisions), batch_size)
+
+        return summary_loss, summary_prec
 
     def train_one_epoch(self, train_loader):
         self.model.train()
@@ -361,7 +495,7 @@ class Fitter:
             'model_state_dict': self.model.model.state_dict(),
             'optimizer_state_dict': self.optimizer.state_dict(),
             'scheduler_state_dict': self.scheduler.state_dict(),
-            'best_summary_loss': self.best_summary_loss,
+            'best_summary_loss': self.best_summary_prec,
             'epoch': self.epoch,
         }, path)
 
@@ -381,9 +515,9 @@ class Fitter:
 
 class TrainGlobalConfig:
     num_workers = 4
-    batch_size = 4
-    n_epochs = 40 # n_epochs = 40
-    lr = 0.0002
+    batch_size = 1
+    n_epochs = 20
+    lr = 0.00001
 
     folder = 'effdet5-cutmix-augmix'
 
@@ -437,7 +571,7 @@ def run_training():
     )
     val_loader = torch.utils.data.DataLoader(
         validation_dataset,
-        batch_size=TrainGlobalConfig.batch_size,
+        batch_size=TrainGlobalConfig.batch_size+1,
         num_workers=TrainGlobalConfig.num_workers,
         shuffle=False,
         sampler=SequentialSampler(validation_dataset),
@@ -448,22 +582,38 @@ def run_training():
     fitter = Fitter(model=net, device=device, config=TrainGlobalConfig)
     fitter.fit(train_loader, val_loader)
 
-def get_net():
+def load_train_net(checkpoint_path):
     config = get_efficientdet_config('tf_efficientdet_d5')
     net = EfficientDet(config, pretrained_backbone=False)
-    # checkpoint = torch.load(f'{DIR_INPUT}/input/efficientdet/efficientdet_d4-5b370b7a.pth')
-    checkpoint = torch.load(f'{DIR_INPUT}/input/efficientdet/efficientdet_d5-ef44aea8.pth')
-    net.load_state_dict(checkpoint)
-    # checkpoint = torch.load(f'{DIR_INPUT}/input/efficientdet/fold0-best-all-states.bin')
-    # net.load_state_dict(checkpoint['model_state_dict'])
-
-    # del checkpoint
 
     config.num_classes = 1
-    config.image_size = 512
+    config.image_size=1024
     net.class_net = HeadNet(config, num_outputs=config.num_classes, norm_kwargs=dict(eps=.001, momentum=.01))
+
+    checkpoint = torch.load(checkpoint_path)
+    net.load_state_dict(checkpoint['model_state_dict'])
+
     return DetBenchTrain(net, config)
 
-net = get_net()
+
+def load_eval_net(checkpoint_path):
+    config = get_efficientdet_config('tf_efficientdet_d5')
+    net = EfficientDet(config, pretrained_backbone=False)
+
+    config.num_classes = 1
+    config.image_size = 1024
+    net.class_net = HeadNet(config, num_outputs=config.num_classes, norm_kwargs=dict(eps=.001, momentum=.01))
+
+    checkpoint = torch.load(checkpoint_path)
+    net.load_state_dict(checkpoint['model_state_dict'])
+
+    del checkpoint
+    gc.collect()
+    net = DetBenchPredict(net, config)
+    net.eval()
+
+    return net.cuda()
+
+net = load_train_net(f'{DIR_INPUT}effdet5-cutmix-augmix/last-checkpoint-all2.bin')
 
 run_training()
