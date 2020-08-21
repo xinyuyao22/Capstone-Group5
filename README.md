@@ -1,2 +1,3 @@
 # Global-Wheat-Detection
-For the Capstone project, we plan to join an ongoing Kaggle competition: Global Wheat Detection, where we are attempting to predict bounding boxes around each wheat head in images. These images can be used to estimate the density and size of wheat heads in different varieties. Farmers can use the data to assess health and maturity when making management decisions in their fields.
+1. Use Kaggle API to download the data 'kaggle competitions download -c global-wheat-detection'.
+2. Code used to train and inference YOLO, EfficientDet and Faster R-CNN is under code folder.
